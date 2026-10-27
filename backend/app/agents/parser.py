@@ -20,13 +20,22 @@ SKILL_TAXONOMY_WEIGHTS = {
     "tableau": 1.5, "power bi": 1.5, "salesforce": 1.5, "sap": 1.5,
     "workday": 1.5, "jira": 1.0, "figma": 1.2, "ui/ux": 1.5,
     "product management": 1.5, "project management": 1.5, "agile": 1.0,
-    "scrum": 1.0, "seo": 1.2, "content marketing": 1.2, "accounting": 1.2
+    "scrum": 1.0, "seo": 1.2, "content marketing": 1.2, "accounting": 1.2,
+    # SAP UI5 / Fiori / BTP stack (Harshitha's profile, 2026-10-27)
+    "ui5": 2.0, "fiori": 2.0, "fiori elements": 1.8, "capm": 1.8,
+    "btp": 1.8, "odata": 1.8, "fpm": 1.8, "brh": 1.5,
+    "batch release hub": 1.5, "mrm": 1.5, "bas": 1.5, "sbpa": 1.5,
+    "build process automation": 1.5, "cloud foundry": 1.5, "work zone": 1.5,
+    "hana": 1.5, "s/4hana": 1.5, "s4hana": 1.5,
+    "html5": 1.0, "json": 1.2, "xml": 1.2
 }
 
 
 def extract_skills_from_text(text: str) -> list[str]:
     """Extract known skills without injecting a DevOps profile for unknown resumes."""
-    text_lower = text.lower()
+    # Collapse line breaks/tabs so multi-word skills still match when a PDF
+    # wraps them across lines (e.g. "Batch Release\nHub").
+    text_lower = re.sub(r"\s+", " ", text.lower())
     return [
         skill for skill in SKILL_TAXONOMY_WEIGHTS
         if re.search(r"(?<![\w-])" + re.escape(skill) + r"(?![\w-])", text_lower)
