@@ -116,6 +116,10 @@ class MarketDiscoveryAgent:
         "developer", "engineer", "analyst", "designer", "manager",
     )
 
+    # When the candidate has SAP skills, these lead the board query so the
+    # search asks for SAP roles instead of generic developer roles.
+    SAP_QUERY_PRIORITY = ("fiori", "ui5", "btp", "capm", "sap")
+
     def __init__(self, sources: list[dict[str, str]] | None = None, timeout: float = 8.0):
         self.sources = sources or self._configured_sources()
         self.timeout = timeout
@@ -293,6 +297,7 @@ class MarketDiscoveryAgent:
     @classmethod
     def _search_query(cls, candidate_terms: set[str]) -> str:
         """Build a short source query while preserving role and skill signals."""
+        sap_terms = [term for term in cls.SAP_QUERY_PRIORITY if term in candidate_terms]
         role_terms = sorted(
             (term for term in candidate_terms if term in cls.ROLE_TERMS),
             key=lambda term: (
@@ -306,7 +311,7 @@ class MarketDiscoveryAgent:
             (term for term in candidate_terms if term not in cls.ROLE_TERMS),
             key=lambda term: (-len(term), term),
         )
-        return " ".join((role_terms + skill_terms)[:3])
+        return " ".join((sap_terms + role_terms + skill_terms)[:3])
 
     def discover_market_jobs(
         self,

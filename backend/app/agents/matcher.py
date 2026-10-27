@@ -10,6 +10,16 @@ _STOPWORDS = {
     "are", "our", "job", "role", "years", "year", "experience",
 }
 
+# A role asking up to this many years above the candidate still counts as
+# meeting the experience request (Harshitha's near-5-year rule: a 4-year
+# candidate is fine for a 5-year role).
+EXPERIENCE_GRACE_YEARS = 1.0
+
+# Employers and domains that are never a fit for this profile, no matter the
+# score. Applied at ranking time so exclusions stay visible, not silent.
+EXCLUDED_EMPLOYERS = ("infosys", "accenture")
+MAX_BAND_YEARS = 7.0
+
 
 class HybridJobMatcherAgent:
     def __init__(
@@ -130,13 +140,22 @@ class HybridJobMatcherAgent:
 
         cand_years = float(cand_years or 0.0)
         req_years = float(req_years or 0.0)
-        if cand_years >= req_years:
+        shortfall = req_years - cand_years
+        if shortfall <= 0:
             phi_exp = 1.0
             experience_fit = "Experience-ready"
             experience_note = "Experience meets the request, so the score is left intact."
+        elif shortfall <= EXPERIENCE_GRACE_YEARS:
+            # Near-band roles (e.g. asking 5 years of a 4-year candidate) count
+            # as meeting the request instead of taking an experience haircut.
+            phi_exp = 1.0
+            experience_fit = "Experience-ready"
+            experience_note = (
+                f"Within the {EXPERIENCE_GRACE_YEARS:.0f}-year grace band, so experience "
+                "is treated as meeting the request."
+            )
         else:
-            phi_exp = math.exp(-self.decay_lambda * (req_years - cand_years))
-            shortfall = req_years - cand_years
+            phi_exp = math.exp(-self.decay_lambda * shortfall)
             experience_fit = "Near fit" if phi_exp >= 0.70 else "Stretch role"
             experience_note = (
                 f"{shortfall:.1f} years short of the request, so experience scales the score by {phi_exp:.3f}."
@@ -241,6 +260,40 @@ class HybridJobMatcherAgent:
         if experience_fit == "Stretch role":
             return "Stretch"
         return "Build toward"
+
+
+def apply_profile_filters(ranked: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split ranked openings into kept ones and exclusions with reasons.
+
+    Kept items pass through untouched. Each excluded item keeps its score
+    and gains a reason, so the caller can show what was filtered out and why
+    instead of silently dropping it.
+    """
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for item in ranked:
+        job = item.get("job") or {}
+        company = str(job.get("company") or "").lower()
+        text = f"{job.get('title') or ''} {job.get('description') or ''}"
+        reason = None
+        if any(name in company for name in EXCLUDED_EMPLOYERS):
+            reason = "Excluded employer (Infosys/Accenture)"
+        elif re.search(r"(?<![\w-])plm(?![\w-])", text.lower()):
+            reason = "PLM role excluded (no PLM experience)"
+        elif (job.get("req_years") or 0) >= MAX_BAND_YEARS:
+            reason = "Above experience band (asks 7+ years)"
+        if reason:
+            excluded.append({
+                "company_name": job.get("company") or "",
+                "role_title": job.get("title") or "",
+                "portal_url": job.get("url") or "",
+                "required_experience_years": job.get("req_years") or 0.0,
+                "score_pct": (item.get("evaluation") or {}).get("final_match_score_pct"),
+                "reason": reason,
+            })
+        else:
+            kept.append(item)
+    return kept, excluded
 
 
 def _tier_index(score_pct: float) -> int:

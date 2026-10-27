@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import init_db, get_db
 from app.agents.parser import ResumeParserAgent, SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
 from app.agents.crawler import EthicalCrawlerAgent, MarketDiscoveryAgent
-from app.agents.matcher import HybridJobMatcherAgent, build_market_brief
+from app.agents.matcher import HybridJobMatcherAgent, build_market_brief, apply_profile_filters
 from app.agents.advisor import SkillGapAdvisorAgent
 
 app = FastAPI(
@@ -288,9 +288,10 @@ def rank_market(resume_id: int = Form(1)):
             resume["exp_years"] or 0.0,
             jobs,
         )
+        kept, excluded = apply_profile_filters(ranked)
 
         matches = []
-        for item in ranked:
+        for item in kept:
             job = item["job"]
             evaluation = item["evaluation"]
             advice = advisor_agent.generate_advice(
@@ -324,7 +325,9 @@ def rank_market(resume_id: int = Form(1)):
             "resume_id": resume["id"],
             "semantic_mode": semantic_mode,
             "total_ranked": len(matches),
-            "market_brief": build_market_brief(ranked),
+            "total_excluded": len(excluded),
+            "excluded": excluded,
+            "market_brief": build_market_brief(kept),
             "matches": matches,
         }
     finally:
