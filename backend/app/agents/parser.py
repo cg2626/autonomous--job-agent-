@@ -41,6 +41,60 @@ def extract_skills_from_text(text: str) -> list[str]:
         if re.search(r"(?<![\w-])" + re.escape(skill) + r"(?![\w-])", text_lower)
     ]
 
+
+# Concatenated / vendor-prefixed variants that word-boundary matching misses.
+# Maps the variant to the canonical taxonomy skill (SAP-focused, 2026-10-29).
+SKILL_ALIASES = {
+    "sapui5": "ui5",
+    "openui5": "ui5",
+    "sap ui5": "ui5",
+    "sap fiori": "fiori",
+    "fiori launchpad": "fiori",
+    "sap btp": "btp",
+    "sap business technology platform": "btp",
+    "s4 hana": "s/4hana",
+    "s/4 hana": "s/4hana",
+    "sap s/4hana": "s/4hana",
+    "sap hana": "hana",
+}
+
+
+def extract_skills_fuzzy(text: str, threshold: int = 88) -> list[str]:
+    """extract_skills_from_text, plus alias and fuzzy-variant detection.
+
+    Exact word-boundary matches come first (unchanged behavior). Then:
+    - the SAP alias map catches concatenated variants ("sapui5" -> "ui5");
+    - rapidfuzz partial_token_set_ratio catches near variants
+      ("Fiori Element" -> "fiori elements") for skills with >= 5 characters.
+      Short skills (ui5, btp, fpm, ...) stay exact-only to avoid noise.
+    Falls back to exact+alias matching when rapidfuzz is unavailable.
+    """
+    found = set(extract_skills_from_text(text))
+    lowered = re.sub(r"\s+", " ", str(text).lower())
+
+    for alias, canonical in SKILL_ALIASES.items():
+        if canonical in found:
+            continue
+        if re.search(r"(?<![\w-])" + re.escape(alias) + r"(?![\w-])", lowered):
+            found.add(canonical)
+
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return sorted(found)
+
+    for skill in SKILL_TAXONOMY_WEIGHTS:
+        if skill in found or len(skill) < 5:
+            continue
+        # Cheap pre-check: at least one distinctive token must appear, so the
+        # fuzzy comparison only runs for plausible candidates.
+        tokens = [tok for tok in re.findall(r"[a-z0-9]+", skill) if len(tok) >= 4]
+        if tokens and not any(tok in lowered for tok in tokens):
+            continue
+        if fuzz.partial_token_set_ratio(skill, lowered) >= threshold:
+            found.add(skill)
+    return sorted(found)
+
 class ResumeParserAgent:
     """Dynamic resume parser agent that extracts text, experience tenure, and skills from ANY uploaded PDF resume."""
     def parse_pdf_bytes(self, pdf_bytes: bytes) -> dict:

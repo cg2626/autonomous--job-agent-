@@ -21,7 +21,63 @@ try:
 except ImportError:  # Keep page parsing usable in a minimal test environment.
     httpx = None
 
-from app.agents.parser import SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
+from app.agents.parser import SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text, extract_skills_fuzzy
+from app.agents.sources import ATSBoardSource, AdzunaSource
+
+
+def fuzzy_dedupe_jobs(jobs: list[dict], title_threshold: int = 90) -> list[dict]:
+    """Drop near-duplicate postings found on multiple sources.
+
+    Two jobs are duplicates when their normalized companies match and their
+    normalized titles are fuzzy-similar (rapidfuzz token_set_ratio >=
+    threshold). The copy with the highest relevance_score is kept. Falls back
+    to exact (company, title) matching when rapidfuzz is unavailable.
+    """
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        fuzz = None
+
+    def norm_company(name: Any) -> str:
+        text = re.sub(r"[^a-z0-9 ]", " ", str(name).lower())
+        for suffix in (
+            "private limited", "pvt ltd", "p ltd", "incorporated",
+            "corporation", "technologies", "technology", "solutions",
+            "services", "consulting", "consultancy", "inc", "llc", "ltd",
+            "gmbh", "srl", "pty",
+        ):
+            text = re.sub(rf"\b{re.escape(suffix)}\b", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def norm_title(title: Any) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", str(title).lower())).strip()
+
+    kept: list[dict] = []
+    seen: list[tuple[str, str, dict]] = []  # (company, title, job)
+    for job in jobs:
+        company = norm_company(job.get("company", ""))
+        title = norm_title(job.get("title", ""))
+        duplicate_of = None
+        for kept_company, kept_title, kept_job in seen:
+            if not company or company != kept_company or not title:
+                continue
+            if fuzz is None:
+                is_dup = title == kept_title
+            else:
+                is_dup = bool(kept_title) and fuzz.token_set_ratio(title, kept_title) >= title_threshold
+            if is_dup:
+                duplicate_of = kept_job
+                break
+        if duplicate_of is None:
+            seen.append((company, title, job))
+            kept.append(job)
+        elif job.get("relevance_score", 0) > duplicate_of.get("relevance_score", 0):
+            kept[kept.index(duplicate_of)] = job
+            for i, (seen_company, seen_title, seen_job) in enumerate(seen):
+                if seen_job is duplicate_of:
+                    seen[i] = (seen_company, seen_title, job)
+                    break
+    return kept
 
 
 class EthicalCrawlerAgent:
@@ -354,19 +410,10 @@ class MarketDiscoveryAgent:
             for future in as_completed(futures):
                 try:
                     source, source_name, records = future.result()
-                    for record in records:
-                        job = self._normalize_job(record, source_name, source["url"])
-                        if not job or not self._matches_country(job, country):
-                            continue
-                        relevance = self._relevance(job, candidate_terms)
-                        if candidate_terms and relevance == 0:
-                            continue
-                        job["relevance_score"] = relevance
-                        key = job["portal_url"] or f"{job['company']}|{job['title']}|{job['location']}"
-                        if key in seen_jobs:
-                            continue
-                        seen_jobs.add(key)
-                        jobs.append(job)
+                    self._ingest_records(
+                        records, source_name, source["url"],
+                        jobs, seen_jobs, candidate_terms, country,
+                    )
                 except Exception as exc:
                     source_name = "Unknown source"
                     if future in futures:
@@ -376,12 +423,78 @@ class MarketDiscoveryAgent:
                         )
                     self.last_errors.append({"source": source_name, "error": str(exc)})
 
+        # Vastness lane (2026-10-29): ATS career boards + Adzuna (opt-in).
+        # Failures are isolated per source so a dead board never kills discovery.
+        # ATS pre-filtering uses SAP-first terms when the candidate has them,
+        # so company boards yield SAP roles instead of every open req.
+        sap_terms = {term for term in candidate_terms if term in self.SAP_QUERY_PRIORITY}
+        for source_name, records, source_url in self._discover_extra_sources(
+            search_query, sap_terms or candidate_terms, country
+        ):
+            self._ingest_records(
+                records, source_name, source_url,
+                jobs, seen_jobs, candidate_terms, country,
+            )
+
+        # Better lane (2026-10-29): fuzzy cross-source dedup keeps the
+        # highest-relevance copy of each posting.
+        jobs = fuzzy_dedupe_jobs(jobs)
+
         sorted_jobs = sorted(
             jobs,
             key=lambda job: (-job["relevance_score"], job["company"].lower(), job["title"].lower()),
         )
         self._write_cache(cache_key, sorted_jobs)
         return sorted_jobs
+
+    def _ingest_records(
+        self,
+        records: list[dict[str, Any]],
+        source_name: str,
+        source_url: str,
+        jobs: list[dict[str, Any]],
+        seen_jobs: set[str],
+        candidate_terms: set[str],
+        country: str,
+    ) -> None:
+        """Normalize records and append relevant, unseen jobs (shared by all sources)."""
+        for record in records:
+            job = self._normalize_job(record, source_name, source_url)
+            if not job or not self._matches_country(job, country):
+                continue
+            relevance = self._relevance(job, candidate_terms)
+            if candidate_terms and relevance == 0:
+                continue
+            job["relevance_score"] = relevance
+            key = job["portal_url"] or f"{job['company']}|{job['title']}|{job['location']}"
+            if key in seen_jobs:
+                continue
+            seen_jobs.add(key)
+            jobs.append(job)
+
+    def _discover_extra_sources(
+        self,
+        search_query: str,
+        candidate_terms: set[str],
+        country: str,
+    ) -> list[tuple[str, list[dict[str, Any]], str]]:
+        """[(source_name, records, source_url)] from ATS boards and Adzuna."""
+        out: list[tuple[str, list[dict[str, Any]], str]] = []
+        try:
+            ats = ATSBoardSource()
+            out.extend(ats.discover(candidate_terms))
+            for error in ats.last_errors:
+                self.last_errors.append(error)
+        except Exception as exc:
+            self.last_errors.append({"source": "ATS boards", "error": str(exc)})
+        try:
+            adzuna = AdzunaSource()
+            if adzuna.is_configured:
+                out.append(adzuna.search(search_query, country=country))
+            # Unconfigured Adzuna is not an error: it is an opt-in source.
+        except Exception as exc:
+            self.last_errors.append({"source": "Adzuna", "error": str(exc)})
+        return out
 
     @classmethod
     def _candidate_terms(cls, candidate_skills: list | set, resume_text: str) -> set[str]:
@@ -449,7 +562,7 @@ class MarketDiscoveryAgent:
         full_text = f"{title} {description}"
         weights = {
             skill: SKILL_TAXONOMY_WEIGHTS[skill]
-            for skill in extract_skills_from_text(full_text)
+            for skill in extract_skills_fuzzy(full_text)
         }
         if not weights:
             weights = {"general": 1.0}
